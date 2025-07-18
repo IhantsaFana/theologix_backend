@@ -11,21 +11,22 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 from pathlib import Path
+from decouple import config
+import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
-
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-et)qcnbi20ugbci4a=ly!c15+^8vw=jp^vaktn+30k9@a(r$fz'
+SECRET_KEY = config('SECRET_KEY', default='django-insecure-et)qcnbi20ugbci4a=ly!c15+^8vw=jp^vaktn+30k9@a(r$fz')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = config('DEBUG', default=True, cast=bool)
 
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1,10.0.2.2', cast=lambda v: [s.strip() for s in v.split(',')])
 
 
 # Application definition
@@ -38,10 +39,12 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'corsheaders',
     'api',
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -122,3 +125,59 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+# API Keys Configuration
+OPENROUTER_API_KEY = config('OPENROUTER_API_KEY', default='')
+GEMINI_API_KEY = config('GEMINI_API_KEY', default='')
+SITE_URL = config('SITE_URL', default='https://theologix.app')
+
+# CORS Configuration for Flutter
+CORS_ALLOWED_ORIGINS = config(
+    'CORS_ALLOWED_ORIGINS', 
+    default='http://localhost:3000,http://127.0.0.1:3000',
+    cast=lambda v: [s.strip() for s in v.split(',')]
+)
+
+CORS_ALLOW_ALL_ORIGINS = DEBUG  # Only in development
+
+# REST Framework Configuration
+REST_FRAMEWORK = {
+    'DEFAULT_RENDERER_CLASSES': [
+        'rest_framework.renderers.JSONRenderer',
+    ],
+    'DEFAULT_PARSER_CLASSES': [
+        'rest_framework.parsers.JSONParser',
+    ],
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '100/hour',  # Limite pour éviter l'abus des API LLM
+    }
+}
+
+# Logging Configuration
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'file': {
+            'level': 'INFO',
+            'class': 'logging.FileHandler',
+            'filename': BASE_DIR / 'logs' / 'theologix.log',
+        },
+        'console': {
+            'level': 'DEBUG',
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'loggers': {
+        'api': {
+            'handlers': ['file', 'console'],
+            'level': 'INFO',
+            'propagate': True,
+        },
+    },
+}
+
+# Create logs directory if it doesn't exist
+os.makedirs(BASE_DIR / 'logs', exist_ok=True)

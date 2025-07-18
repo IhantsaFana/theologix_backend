@@ -2,79 +2,77 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.throttling import AnonRateThrottle
 
 import httpx
 import asyncio
 import random
-import itertools
+import logging
+import json
+import re
 
-# API endpoints et clés pour chaque LLM
-LLM_CONFIGS = [
-    {
-        'name': 'openrouter',
-        'url': 'https://openrouter.ai/api/v1/chat/completions',
-        'headers': {'Authorization': 'Bearer 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'},
-        'model': 'mistral:free',
-        'prompt_key': 'messages',
-        'body_builder': lambda prompt: {"model": "mistral:free", "messages": [{"role": "user", "content": prompt}]},
-        'extractor': lambda resp: resp.get('choices', [{}])[0].get('message', {}).get('content', None),
-    },
-    {
-        'name': 'gemini',
-        'url': 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=AIzaSyAdhq0m5qD0FGNIJQx56ApoS8wkDQelLYU',
-        'headers': {},
-        'model': 'gemini-2.0-flash',
-        'prompt_key': 'contents',
-        'body_builder': lambda prompt: {"contents": [{"parts": [{"text": prompt}]}]},
-        'extractor': lambda resp: resp.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', None),
-    },
-]
+from .config import get_llm_configs, GAME_TYPES, get_game_prompt
+from .serializers import BulkGenerateSerializer, GenerateLevelContentSerializer
 
-GAME_TYPES = ['quiz', 'wordgame', 'puzzle', 'story', 'treasure', 'memory']
+logger = logging.getLogger('api')
 
 async def fetch_llm_content(game_type, level, age, difficulty, index=1, total=1, quiz_questions=None):
-    # Ajout d'une consigne spéciale pour les quiz
+    """Génère du contenu via LLM avec gestion d'erreurs et fallback"""
+    llm_configs = get_llm_configs()
+    
+    if not llm_configs:
+        logger.error("No LLM configuration available")
+        return None
+    
+    # Utilise les prompts optimisés
     if game_type == 'quiz' and quiz_questions:
-        prompt = (
-            f"Génère un quiz biblique de type QCM avec {quiz_questions} questions pour le niveau {level}, "
-            f"difficulté: {difficulty}, âge utilisateur: {age}, jeu n°{index} sur {total}. "
-            f"Le quiz doit être cohérent, adapté à l'âge, original, et donner les réponses à la fin."
-        )
+        prompt = get_game_prompt(game_type, level, age, difficulty, questions=quiz_questions)
     else:
-        prompt = (
-            f"Génère un contenu biblique de type {game_type} pour le niveau {level}, "
-            f"difficulté: {difficulty}, âge utilisateur: {age}, "
-            f"jeu n°{index} sur {total} pour ce type. "
-            f"Le contenu doit être cohérent, adapté à l'âge, et original."
-        )
-    for config in LLM_CONFIGS:
+        prompt = get_game_prompt(game_type, level, age, difficulty)
+    
+    logger.info(f"Generation {game_type} level {level} for age {age}")
+    
+    for config in llm_configs:
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=20) as client:
                 body = config['body_builder'](prompt)
                 response = await client.post(config['url'], json=body, headers=config['headers'])
+                
                 if response.status_code == 200:
-                    data = response.json() if callable(getattr(response, 'json', None)) else response.json
+                    data = response.json()
                     content = config['extractor'](data)
-                    # On ne retourne que si le contenu est non vide et ne ressemble pas à un fallback
-                    if content and not content.strip().startswith('[Fallback'):
-                        return content
-        except Exception:
+                    
+                    if content and len(content.strip()) > 10:
+                        logger.info(f"Content generated successfully via {config['name']}")
+                        return content.strip()
+                else:
+                    logger.warning(f"API error {config['name']}: {response.status_code}")
+                    
+        except httpx.TimeoutException:
+            logger.warning(f"Timeout for {config['name']}")
+        except Exception as e:
+            logger.error(f"Error {config['name']}: {str(e)}")
             continue
-    return None  # Ne retourne rien si fallback
+    
+    logger.error(f"Failed to generate {game_type} level {level}")
+    return None
 
 class BulkGenerateView(APIView):
+    throttle_classes = [AnonRateThrottle]
+    
     def get(self, request):
-        try:
-            max_level = int(request.query_params.get('levels', 10))
-        except (TypeError, ValueError):
-            return Response({'error': 'Paramètre levels invalide'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            age = int(request.query_params.get('age', 8))
-        except (TypeError, ValueError):
-            age = 8
+        serializer = BulkGenerateSerializer(data=request.query_params)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        
+        max_level = serializer.validated_data['levels']
+        age = serializer.validated_data['age']
 
         async def ask_llm_for_full_structure():
+            llm_configs = get_llm_configs()
+            if not llm_configs:
+                return []
+                
             prompt = (
                 "Tu es un game designer expert en jeux éducatifs bibliques pour enfants. "
                 f"Voici la liste des types de jeux disponibles : {', '.join(GAME_TYPES)}. "
@@ -84,33 +82,35 @@ class BulkGenerateView(APIView):
                 "Pour chaque niveau, donne un JSON structuré : level, difficulty, games (liste ordonnée d'objets avec type, consigne, nombre de questions si quiz, etc.). "
                 "N'invente pas de nouveaux types de jeux. Ne mets pas de fallback. Ne donne que la structure, pas le contenu des jeux."
             )
-            import re, json
-            for config in LLM_CONFIGS:
+            
+            for config in llm_configs:
                 try:
                     async with httpx.AsyncClient(timeout=30) as client:
                         body = config['body_builder'](prompt)
                         response = await client.post(config['url'], json=body, headers=config['headers'])
                         if response.status_code == 200:
-                            data = response.json() if callable(getattr(response, 'json', None)) else response.json
+                            data = response.json()
                             content = config['extractor'](data)
                             if content:
                                 # Extraction robuste du JSON
-                                # 1. Chercher un bloc JSON dans ``` ou ```json
                                 match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", content)
                                 if match:
                                     content = match.group(1)
-                                # 2. Sinon, chercher le premier [ et le dernier ]
+                                
                                 if not content.strip().startswith('['):
                                     start = content.find('[')
                                     end = content.rfind(']')
                                     if start != -1 and end != -1:
                                         content = content[start:end+1]
-                                # 3. Essayer de parser
+                                
                                 try:
-                                    return json.loads(content)
-                                except Exception:
+                                    result = json.loads(content)
+                                    logger.info(f"Structure generated successfully via {config['name']}")
+                                    return result
+                                except json.JSONDecodeError:
                                     continue
-                except Exception:
+                except Exception as e:
+                    logger.error(f"Error generating structure via {config['name']}: {str(e)}")
                     continue
             return []
 
@@ -121,16 +121,16 @@ class BulkGenerateView(APIView):
         return Response(structure)
 
 class GenerateLevelContentView(APIView):
+    throttle_classes = [AnonRateThrottle]
+    
     def get(self, request):
-        try:
-            level = int(request.query_params.get('level', 1))
-        except (TypeError, ValueError):
-            return Response({'error': 'Paramètre level invalide'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            age = int(request.query_params.get('age', 8))
-        except (TypeError, ValueError):
-            age = 8
+        serializer = GenerateLevelContentSerializer(data=request.query_params)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        
+        level = serializer.validated_data['level']
+        age = serializer.validated_data['age']
+        specific_game_types = serializer.validated_data.get('game_types')
 
         def get_difficulty(level, age):
             if level <= 2:
@@ -140,19 +140,26 @@ class GenerateLevelContentView(APIView):
             else:
                 return 'difficile'
 
-        def random_game_sequence(level):
+        def random_game_sequence(level, specific_types=None):
+            if specific_types:
+                return specific_types
+                
             sequence = []
-            total_games = random.randint(5 + level, 8 + level * 2)
+            total_games = min(random.randint(4 + level, 6 + level), 10)  # Limite pour éviter timeouts
+            
             if level == 1:
                 sequence += ['quiz'] * random.randint(2, 3)
-                sequence += ['wordgame'] * random.randint(2, 3)
+                sequence += ['wordgame'] * random.randint(1, 2)
             elif level == 2:
-                sequence += ['quiz'] * random.randint(2, 4)
-                sequence += ['wordgame'] * random.randint(2, 4)
+                sequence += ['quiz'] * random.randint(2, 3)
+                sequence += ['wordgame'] * random.randint(1, 2)
+                sequence += [random.choice(['story', 'memory'])]
             else:
                 for _ in range(total_games):
                     sequence.append(random.choice(GAME_TYPES))
+            
             random.shuffle(sequence)
+            # Évite les répétitions consécutives
             for i in range(1, len(sequence)):
                 if sequence[i] == sequence[i-1]:
                     alt = [g for g in GAME_TYPES if g != sequence[i]]
@@ -161,21 +168,30 @@ class GenerateLevelContentView(APIView):
             return sequence
 
         difficulty = get_difficulty(level, age)
-        sequence = random_game_sequence(level)
-        quiz_sizes = [random.randint(3, 10) for _ in sequence if _ == 'quiz']
+        sequence = random_game_sequence(level, specific_game_types)
+        quiz_sizes = [random.randint(3, 8) for _ in sequence if _ == 'quiz']  # Réduit pour éviter timeouts
         quiz_idx = 0
 
         async def generate_level():
             tasks = []
+            current_quiz_idx = 0
             for idx, game in enumerate(sequence):
-                if game == 'quiz':
-                    qsize = quiz_sizes[quiz_idx]
-                    quiz_idx += 1
+                if game == 'quiz' and current_quiz_idx < len(quiz_sizes):
+                    qsize = quiz_sizes[current_quiz_idx]
+                    current_quiz_idx += 1
                     tasks.append(fetch_llm_content(game, level, age, difficulty, idx+1, len(sequence), quiz_questions=qsize))
                 else:
                     tasks.append(fetch_llm_content(game, level, age, difficulty, idx+1, len(sequence)))
-            results = await asyncio.gather(*tasks)
-            filtered = [(g, r) for g, r in zip(sequence, results) if r]
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            filtered = []
+            
+            for game, result in zip(sequence, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error generating {game}: {str(result)}")
+                elif result:
+                    filtered.append((game, result))
+            
             games = {}
             for g, r in filtered:
                 games.setdefault(g, []).append(r)
@@ -183,25 +199,29 @@ class GenerateLevelContentView(APIView):
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        games = loop.run_until_complete(generate_level())
-        loop.close()
+        try:
+            games = loop.run_until_complete(generate_level())
+        finally:
+            loop.close()
+            
         return Response({'level': level, 'difficulty': difficulty, 'games': games})
 
 class BulkGenerateWithContentView(APIView):
+    throttle_classes = [AnonRateThrottle]
+    
     def get(self, request):
-        try:
-            max_level = int(request.query_params.get('levels', 10))
-        except (TypeError, ValueError):
-            return Response({'error': 'Paramètre levels invalide'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            age = int(request.query_params.get('age', 8))
-        except (TypeError, ValueError):
-            age = 8
-
-        import re, json
+        serializer = BulkGenerateSerializer(data=request.query_params)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        
+        max_level = serializer.validated_data['levels']
+        age = serializer.validated_data['age']
 
         async def ask_llm_for_full_structure():
+            llm_configs = get_llm_configs()
+            if not llm_configs:
+                return []
+                
             prompt = (
                 "Tu es un game designer expert en jeux éducatifs bibliques pour enfants. "
                 f"Voici la liste des types de jeux disponibles : {', '.join(GAME_TYPES)}. "
@@ -211,13 +231,14 @@ class BulkGenerateWithContentView(APIView):
                 "Pour chaque niveau, donne un JSON structuré : level, difficulty, games (liste ordonnée d'objets avec type, consigne, nombre de questions si quiz, etc.). "
                 "N'invente pas de nouveaux types de jeux. Ne mets pas de fallback. Ne donne que la structure, pas le contenu des jeux."
             )
-            for config in LLM_CONFIGS:
+            
+            for config in llm_configs:
                 try:
                     async with httpx.AsyncClient(timeout=30) as client:
                         body = config['body_builder'](prompt)
                         response = await client.post(config['url'], json=body, headers=config['headers'])
                         if response.status_code == 200:
-                            data = response.json() if callable(getattr(response, 'json', None)) else response.json
+                            data = response.json()
                             content = config['extractor'](data)
                             if content:
                                 match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", content)
@@ -229,14 +250,21 @@ class BulkGenerateWithContentView(APIView):
                                     if start != -1 and end != -1:
                                         content = content[start:end+1]
                                 try:
-                                    return json.loads(content)
-                                except Exception:
+                                    result = json.loads(content)
+                                    logger.info(f"Complete structure generated via {config['name']}")
+                                    return result
+                                except json.JSONDecodeError:
                                     continue
-                except Exception:
+                except Exception as e:
+                    logger.error(f"Error generating complete structure via {config['name']}: {str(e)}")
                     continue
             return []
 
         async def fetch_content_for_game(game, level, age, difficulty):
+            llm_configs = get_llm_configs()
+            if not llm_configs:
+                return None
+                
             # Compose un prompt contextuel pour chaque jeu
             prompt = f"Tu es un assistant IA pour un jeu éducatif biblique. Génère le contenu complet pour ce jeu :\n"
             prompt += f"- Type de jeu : {game.get('type')}\n"
@@ -260,27 +288,38 @@ class BulkGenerateWithContentView(APIView):
                 prompt += f"- Nombre d'indices : {game['nombre_d_indices']}\n"
             prompt += f"- Niveau : {level}\n- Difficulté : {difficulty}\n- Âge utilisateur : {age}\n"
             prompt += "Le contenu doit être original, adapté à l'âge, cohérent, et prêt à être utilisé dans le jeu. Réponds uniquement par le contenu, sans explication."
-            for config in LLM_CONFIGS:
+            
+            for config in llm_configs:
                 try:
                     async with httpx.AsyncClient(timeout=30) as client:
                         body = config['body_builder'](prompt)
                         response = await client.post(config['url'], json=body, headers=config['headers'])
                         if response.status_code == 200:
-                            data = response.json() if callable(getattr(response, 'json', None)) else response.json
+                            data = response.json()
                             content = config['extractor'](data)
-                            if content and not content.strip().startswith('[Fallback'):
+                            if content and len(content.strip()) > 10:
                                 return content.strip()
-                except Exception:
+                except Exception as e:
+                    logger.error(f"Error generating game content via {config['name']}: {str(e)}")
                     continue
             return None
 
         async def generate_full():
             structure = await ask_llm_for_full_structure()
+            if not structure:
+                return []
+                
             # structure = [ {level, difficulty, games: [ ... ]}, ... ]
             for level_obj in structure:
                 level = level_obj.get('level')
                 difficulty = level_obj.get('difficulty')
                 games = level_obj.get('games', [])
+                
+                # Limite le nombre de jeux pour éviter les timeouts
+                if len(games) > 8:
+                    games = games[:8]
+                    level_obj['games'] = games
+                
                 # Pour compatibilité, accepter liste d'objets ou liste de dicts
                 for game in games:
                     content = await fetch_content_for_game(game, level, age, difficulty)
@@ -289,6 +328,8 @@ class BulkGenerateWithContentView(APIView):
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(generate_full())
-        loop.close()
+        try:
+            result = loop.run_until_complete(generate_full())
+        finally:
+            loop.close()
         return Response(result)
